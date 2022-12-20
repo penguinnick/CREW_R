@@ -1,0 +1,152 @@
+---
+title: "Update_AllWells"
+author: "Nick Triozzi"
+date: "2022-12-18"
+output: html_document
+---
+
+## Overview
+This code can be used to update a CSV file containing AllWells_updated ArcGIS Online resource with current CalGEM AllWells_gis data. CalGEM updates the dataset daily. AllWells_updated has additional fields that are not included with the CalGEM resource. This procedure will merge CalGEM's data with the AllWells_updated data, retaining fields of interest in the latter. After this procedure is completed, the user must re-publish the AllWells_updated dataset on ArcGIS Online and update any layers or views that used it so that Web Maps will reflect the current status of California wells.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+source("R/using.R")
+using("esri2sf", "sp", "tidyverse", "rgdal")
+```
+
+## Retrieve Data
+
+The GIS datasets used here include AllWells_updated (A CREW resource) and CalGEM's AllWells_gis dataset which is updated daily. Both of these datasets are hosted as Web Feature Services on ArcGIS Online. The CREW resource must first be downloaded as a CSV file and saved in the */data*  directory. CalGEM's WFS can be accessed using a url. 
+
+Below we set variable CalGEM.url to the WFS data and retrieve the data from it's online service.
+
+```{r CalGEM wells}
+#-- set url to WFS to variable 
+# crew.url = "https://services1.arcgis.com/4TXrdeWh0RyCqPgB/arcgis/rest/services/AllWells_updated/FeatureServer/0"
+CalGEM.url = "https://gis.conservation.ca.gov/server/rest/services/WellSTAR/Wells/MapServer/0"
+
+#-- use esri2sf to retrieve data as a sf object
+# crew = esri2sf(crew.url) #-- call url
+calgem = esri2sf(CalGEM.url) #-- call url
+
+#-- inspect calgem
+class(calgem)
+str(calgem) # note SpudDate field is character type
+
+```
+
+## Download AllWells_updated
+
+Since this layer is not shared publically it cannot be accessed using a url. The data must be downloaded from the layer overview page <https://ucsb.maps.arcgis.com/home/item.html?id=b7b01223c2d042a6a04e3e6bdcb0a763>. You will need to sign into ArcGIS Online and you will need to be a member of the CREW Group to access and export the layer. Export the layer as a CSV file then download it and save the zip file to the *CREW_R/data* directory. 
+
+Set the variable *well.csv* to the zip file name.
+
+```{r AllWells_updated}
+#-- run if the zipped csv file is the only file in the data directory
+well.zip = dir("./data", full.names = T)
+unzip(well.zip, exdir = "./data") 
+#-- Otherwise, specify the zipped filename here (and uncomment)
+# well.csv = "AllWells_updated_csv122022.zip"
+# unzip(paste0("./data/", well.csv), exdir = "./data") # uncomment with line above to unzip file
+
+#-- read in csv file
+well.csv=list.files("./data", pattern="csv", full.names = T)
+crew.wells = read.csv(well.csv,header = T)
+
+#-- inspect files
+str(crew.wells)
+str(calgem)
+
+#-- note changes in well status
+status = left_join(data.frame(crew.wells %>% group_by(WllStts) %>% summarise(CREWcount=n())),
+          data.frame(calgem %>% group_by(WellStatus) %>% summarise(calGEMcount=n())),
+          by=c("WllStts"="WellStatus")
+          )
+status$diff = status$calGEMcount-status$CREWcount
+status[,-4] # shows how many wells changed status in each category
+```
+
+## Drop fields from All Wells
+
+## Join tables based on API
+
+Now that we have both datasets in memory we will join the tables together, matching records based on API. For the CalGEM dataset, API is stored as a character. In AllWells_updated it is an integer. We will need to reformat API in the CalGEM dataset to integer so that we can update the file on ArcGIS Online.
+
+
+```{r, join tables}
+#-- note different data types in API columns
+str(crew.wells$API)
+str(calgem$API)
+
+#-- set API to integer
+calgem$API = as.integer(calgem$API)
+#-- set Section to integer
+calgem$Section = as.integer(calgem$Section)
+
+#-- join tables
+new.wells = full_join(crew.wells, calgem, by=c("API"="API"))
+
+#-- inspect
+str(new.wells)
+
+#-- check new table has new records
+isTRUE(nrow(new.wells)==nrow(calgem))
+```
+
+## Reformat Join Table
+
+The datafile used to upate the ArcGIS Online layer must have the same schema, meaning field types and names in the new table we are creating here must match the existing layer's schema. We will preserve the existing column names and use them later.
+
+```{r format}
+#-- existing column names
+crew.cols = colnames(crew.wells)
+crew.cols = crew.cols[c(-38,-39)]
+
+#-- drop old columns, keep CalGEM columns, re-order to match existing schema and to rename columns
+colnames(new.wells[,c(40,2,41:46,48,47,49:56,19,20,57,63,64,58:60,62,61,29:37)]) # columns from CalGEM and CREW files being kept
+new.wells.fmt = new.wells[,c(40,2,41:46,48,47,49:56,19,20,57,63,64,58:60,62,61,29:37)] # drop cols and create new table
+
+#-- compare column names. 
+data.frame(crew.col.names=crew.cols, new.wells.col.names = colnames(new.wells.fmt))
+
+#-- replace column names
+colnames(new.wells.fmt) = crew.cols
+
+#-- function to reformat date fields
+to.Date = function(x){
+  for (i in 1:length(x)){
+    if(is.na(x[i])==FALSE){
+      x[i]=paste(gsub("-", "/", x[i] ), "12:00:00 PM")
+    }
+  }
+  return(x)
+}
+#-- Replace SpudDate with formatted dates
+new.wells.fmt$SpudDate = to.Date(new.wells.fmt$SpudDate)
+
+
+```
+
+## Prepare for upload as shapefile
+Now we will create a shapefile from the updated data. The shapefile consists of several files so we will make a new directory to store the files. The directory needs to be zipped before updating the AllWells_updated layer on to ArcGIS Online.
+
+```{r make spatial}
+#-- create directory to store updated file
+dir.create("./data/CalGEMwell_updates")
+
+#-- specify filename
+Updated.File = paste0("Well_updates_", Sys.Date())
+Updated.File
+
+#-- create a shapefile from new.wells.fmt
+coords<-data.frame(x =  new.wells.fmt$Longitd , y = new.wells.fmt$Latitud  ) # set coordinates
+crs<-"+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs +towgs84=0,0,0"   # set projection
+new.wells.spdf = SpatialPointsDataFrame(coords=coords, data =new.wells.fmt,  proj4string = CRS(crs))  # create spdf
+writeOGR(new.wells.spdf, "./data/CalGEMwell_updates", Updated.File, driver="ESRI Shapefile")  # write shapefile
+# cgem = readOGR("./data/CalGEMwell_updates", Updated.File) # read in file
+
+```
+
+## Next Steps
+
+A new shapefile has been created with the CalGEM updates. This file will be used to update the AllWells_updated layer. Follow instructions here: <https://support.esri.com/en/Technical-Article/000015842>
